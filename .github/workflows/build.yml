@@ -1,0 +1,470 @@
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Android SDK pieces
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+      - name: Write Gradle and manifest files
+        run: |
+          mkdir -p tapboard/app/src/main/java/com/tapboard/app
+          cd tapboard
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Tapboard"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.tapboard.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.tapboard.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="Tapboard"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+              </application>
+          </manifest>
+          EOF
+      - name: Write Ui and Player
+        run: |
+          cd tapboard/app/src/main/java/com/tapboard/app
+          cat > Ui.kt <<'EOF'
+          package com.tapboard.app
+
+          import android.content.Context
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.widget.TextView
+
+          val PALETTE = intArrayOf(
+              0xFFFF6B57.toInt(), 0xFFFFB020.toInt(), 0xFF19B8A6.toInt(),
+              0xFF8B6CFF.toInt(), 0xFFFF5FA2.toInt(), 0xFF4D94FF.toInt()
+          )
+
+          fun dp(c: Context, v: Int): Int = (v * c.resources.displayMetrics.density).toInt()
+
+          fun pill(c: Context, text: String, color: Int, onClick: (TextView) -> Unit): TextView {
+              val t = TextView(c)
+              t.text = text
+              t.setTextColor(0xFF1A1630.toInt())
+              t.textSize = 15f
+              t.setTypeface(t.typeface, Typeface.BOLD)
+              t.gravity = Gravity.CENTER
+              t.maxLines = 1
+              t.ellipsize = TextUtils.TruncateAt.END
+              t.setPadding(dp(c, 10), dp(c, 12), dp(c, 10), dp(c, 12))
+              val bg = GradientDrawable()
+              bg.cornerRadius = dp(c, 14).toFloat()
+              bg.setColor(color)
+              t.background = bg
+              t.setOnClickListener { onClick(t) }
+              return t
+          }
+          EOF
+          cat > Player.kt <<'EOF'
+          package com.tapboard.app
+
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.media.audiofx.LoudnessEnhancer
+          import java.io.File
+
+          object Player {
+              private val active = ArrayList<MediaPlayer>()
+              private val fx = HashMap<MediaPlayer, LoudnessEnhancer>()
+              @Volatile var boost = true
+
+              fun play(f: File) {
+                  try {
+                      val mp = MediaPlayer()
+                      mp.setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                              .build()
+                      )
+                      mp.setDataSource(f.absolutePath)
+                      mp.setOnPreparedListener { p ->
+                          if (boost) {
+                              try {
+                                  val le = LoudnessEnhancer(p.audioSessionId)
+                                  le.setTargetGain(1000)
+                                  le.setEnabled(true)
+                                  synchronized(active) { fx[p] = le }
+                              } catch (e: Exception) { }
+                          }
+                          p.start()
+                      }
+                      mp.setOnCompletionListener { release(it) }
+                      mp.setOnErrorListener { p, _, _ -> release(p); true }
+                      synchronized(active) { active.add(mp) }
+                      mp.prepareAsync()
+                  } catch (e: Exception) { }
+              }
+
+              private fun release(p: MediaPlayer) {
+                  synchronized(active) {
+                      active.remove(p)
+                      fx.remove(p)?.release()
+                  }
+                  try { p.stop() } catch (e: Exception) { }
+                  try { p.release() } catch (e: Exception) { }
+              }
+
+              fun stopAll() {
+                  val copy = synchronized(active) { ArrayList(active) }
+                  for (p in copy) release(p)
+              }
+
+              fun maxVolume(c: Context) {
+                  val am = c.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0)
+              }
+          }
+          EOF
+      - name: Write SoundStore
+        run: |
+          cd tapboard/app/src/main/java/com/tapboard/app
+          cat > SoundStore.kt <<'EOF'
+          package com.tapboard.app
+
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import kotlin.math.PI
+          import kotlin.math.exp
+          import kotlin.math.floor
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.sin
+          import kotlin.random.Random
+
+          object SoundStore {
+              private const val SR = 44100
+
+              fun dir(c: Context): File {
+                  val d = File(c.filesDir, "sounds")
+                  d.mkdirs()
+                  return d
+              }
+
+              fun all(c: Context): List<File> =
+                  (dir(c).listFiles() ?: emptyArray()).filter { it.isFile }.sortedBy { it.name.lowercase() }
+
+              fun label(f: File): String = f.nameWithoutExtension.replace('_', ' ')
+
+              fun addFrom(c: Context, uri: Uri) {
+                  var name = "sound.mp3"
+                  c.contentResolver.query(uri, null, null, null, null)?.use {
+                      if (it.moveToFirst()) {
+                          val i = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (i >= 0) name = it.getString(i)
+                      }
+                  }
+                  name = name.replace(Regex("[^A-Za-z0-9._ -]"), "_")
+                  c.contentResolver.openInputStream(uri)?.use { input ->
+                      File(dir(c), name).outputStream().use { out -> input.copyTo(out) }
+                  }
+              }
+
+              private fun gen(sec: Double, fn: (Double) -> Double): ShortArray {
+                  val n = (sec * SR).toInt()
+                  return ShortArray(n) { i ->
+                      val t = i.toDouble() / SR
+                      (fn(t).coerceIn(-1.0, 1.0) * 30000).toInt().toShort()
+                  }
+              }
+
+              private fun wav(f: File, s: ShortArray) {
+                  val n = s.size * 2
+                  val bb = ByteBuffer.allocate(44 + n).order(ByteOrder.LITTLE_ENDIAN)
+                  bb.put("RIFF".toByteArray()); bb.putInt(36 + n)
+                  bb.put("WAVE".toByteArray()); bb.put("fmt ".toByteArray())
+                  bb.putInt(16); bb.putShort(1); bb.putShort(1)
+                  bb.putInt(SR); bb.putInt(SR * 2); bb.putShort(2); bb.putShort(16)
+                  bb.put("data".toByteArray()); bb.putInt(n)
+                  for (v in s) bb.putShort(v)
+                  f.writeBytes(bb.array())
+              }
+
+              private fun saw(ph: Double): Double = 2.0 * (ph - floor(ph)) - 1.0
+
+              fun ensureBuiltins(c: Context) {
+                  val prefs = c.getSharedPreferences("tb", Context.MODE_PRIVATE)
+                  if (prefs.getBoolean("built", false)) return
+                  val d = dir(c)
+
+                  wav(File(d, "Airhorn.wav"), gen(1.0) { t ->
+                      val e = min(1.0, t / 0.02) * (if (t < 0.7) 1.0 else (1.0 - t) / 0.3)
+                      (saw(392 * t) + saw(494 * t) + saw(587 * t)) / 3.0 * 0.95 * e
+                  })
+
+                  var pl = 0.0
+                  wav(File(d, "Laser.wav"), gen(0.3) { t ->
+                      pl += 2000.0 * (0.075).pow(t / 0.3) / SR
+                      (if (pl - floor(pl) < 0.5) 0.6 else -0.6) * exp(-t * 3)
+                  })
+
+                  wav(File(d, "Ding.wav"), gen(1.2) { t ->
+                      (sin(2 * PI * 1318 * t) * 0.6 + sin(2 * PI * 1976 * t) * 0.3) * exp(-t * 4)
+                  })
+
+                  var pb = 0.0
+                  wav(File(d, "Boom.wav"), gen(1.4) { t ->
+                      pb += 90.0 * (25.0 / 90.0).pow(t / 1.4) / SR
+                      sin(2 * PI * pb) * exp(-t * 2.5) + (Random.nextDouble() * 2 - 1) * 0.4 * exp(-t * 6)
+                  })
+
+                  var pt = 0.0
+                  wav(File(d, "Sad_trombone.wav"), gen(3.0) { t ->
+                      val f = when {
+                          t < 0.55 -> 233.0
+                          t < 1.1 -> 220.0
+                          t < 1.65 -> 208.0
+                          else -> 196.0 - 46.0 * ((t - 1.65) / 1.35)
+                      }
+                      val lt = if (t < 1.65) (t % 0.55) else (t - 1.65)
+                      pt += f / SR
+                      saw(pt) * 0.5 * min(1.0, lt / 0.03) * exp(-lt * 0.6) * min(1.0, (3.0 - t) / 0.1)
+                  })
+
+                  var ps = 0.0
+                  wav(File(d, "Siren.wav"), gen(2.0) { t ->
+                      ps += (600.0 + 350.0 * (0.5 + 0.5 * sin(2 * PI * 1.1 * t))) / SR
+                      (if (ps - floor(ps) < 0.5) 0.5 else -0.5) * min(1.0, t / 0.02) * min(1.0, (2.0 - t) / 0.05)
+                  })
+
+                  wav(File(d, "Coin.wav"), gen(0.6) { t ->
+                      val first = t < 0.09
+                      val f = if (first) 988.0 else 1319.0
+                      val lt = if (first) t else t - 0.09
+                      val sq = if (sin(2 * PI * f * t) >= 0) 0.45 else -0.45
+                      sq * exp(-lt * (if (first) 6.0 else 7.0))
+                  })
+
+                  val notes = doubleArrayOf(1047.0, 1319.0, 1568.0, 2093.0, 2637.0, 3136.0)
+                  wav(File(d, "Sparkle.wav"), gen(0.8) { t ->
+                      var s = 0.0
+                      for (i in notes.indices) {
+                          val lt = t - i * 0.07
+                          if (lt >= 0) s += sin(2 * PI * notes[i] * lt) * exp(-lt * 9) * 0.3
+                      }
+                      s
+                  })
+
+                  prefs.edit().putBoolean("built", true).apply()
+              }
+          }
+          EOF
+      - name: Write OverlayService
+        run: |
+          cd tapboard/app/src/main/java/com/tapboard/app
+          cat > OverlayService.kt <<'EOF'
+          package com.tapboard.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import kotlin.math.abs
+
+          class OverlayService : Service() {
+              private var wm: WindowManager? = null
+              private var root: LinearLayout? = null
+              private var panel: LinearLayout? = null
+              private var list: LinearLayout? = null
+              private val lp = WindowManager.LayoutParams(
+                  WindowManager.LayoutParams.WRAP_CONTENT,
+                  WindowManager.LayoutParams.WRAP_CONTENT,
+                  WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                  PixelFormat.TRANSLUCENT
+              )
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  startFg()
+                  if (root == null) show()
+                  return START_STICKY
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("board", "Floating board", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stop = PendingIntent.getService(
+                      this, 0, Intent(this, OverlayService::class.java).setAction("STOP"),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, "board")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentTitle("Tapboard is floating")
+                      .setContentText("Tap here to stop it")
+                      .setContentIntent(stop)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun btn(text: String, color: Int, onClick: (TextView) -> Unit): TextView {
+                  val t = pill(this, text, color, onClick)
+                  t.textSize = 13f
+                  val l = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  l.setMargins(dp(this, 3), dp(this, 3), dp(this, 3), dp(this, 3))
+                  t.layoutParams = l
+                  return t
+              }
+
+              private fun show() {
+                  val c = this
+                  val w = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = dp(c, 12)
+                  lp.y = dp(c, 160)
+
+                  val r = LinearLayout(c)
+                  r.orientation = LinearLayout.VERTICAL
+
+                  val bubble = TextView(c)
+                  bubble.text = "\u266A"
+                  bubble.textSize = 24f
+                  bubble.gravity = Gravity.CENTER
+                  bubble.setTextColor(0xFF1A1630.toInt())
+                  val bg = GradientDrawable()
+                  bg.shape = GradientDrawable.OVAL
+                  bg.setColor(PALETTE[3])
+                  bubble.background = bg
+                  r.addView(bubble, LinearLayout.LayoutParams(dp(c, 56), dp(c, 56)))
+
+                  val p = LinearLayout(c)
+                  p.orientation = LinearLayout.VERTICAL
+                  p.visibility = View.GONE
+                  val pbg = GradientDrawable()
+                  pbg.cornerRadius = dp(c, 16).toFloat()
+                  pbg.setColor(0xF2231F3D.toInt())
+                  p.background = pbg
+                  p.setPadding(dp(c, 8), dp(c, 8), dp(c, 8), dp(c, 8))
+
+                  val ctl = LinearLayout(c)
+                  ctl.orientation = LinearLayout.HORIZONTAL
+                  ctl.addView(btn("Stop", PALETTE[0]) { Player.stopAll() })
+                  ctl.addView(btn("Max", PALETTE[1]) { Player.maxVolume(c) })
+                  ctl.addView(btn("Boost", PALETTE[2]) { b ->
+                      Player.boost = !Player.boost
+                      b.alpha = if (Player.boost) 1f else 0.45f
+                  })
+                  ctl.addView(btn("Close", PALETTE[4]) { stopSelf() })
+                  p.addView(ctl, LinearLayout.LayoutParams(dp(c, 280), LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  val sv = ScrollView(c)
+                  val lst = LinearLayout(c)
+                  lst.orientation = LinearLayout.VERTICAL
+                  sv.addView(lst)
+                  p.addView(sv, LinearLayout.LayoutParams(dp(c, 280), dp(c, 300)))
+                  r.addView(p)
+
+                  panel = p
+                  list = lst
+                  root = r
+
+                  bubble.setOnTouchListener(object : View.OnTouchListener {
+                      var sx = 0
+                      var sy = 0
+                      var tx = 0f
+                      var ty = 0f
+                      var moved = false
+                      override fun onTouch(v: View, e: MotionEvent): Boolean {
+                          when (e.action) {
+                              MotionEven
