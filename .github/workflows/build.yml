@@ -433,7 +433,7 @@ jobs:
                   p.visibility = View.GONE
                   val pbg = GradientDrawable()
                   pbg.cornerRadius = dp(c, 16).toFloat()
-                  pbg.setColor(0xF2231F3D.toInt())
+                  pbg.setColor(0xFF231F3D.toInt())
                   p.background = pbg
                   p.setPadding(dp(c, 8), dp(c, 8), dp(c, 8), dp(c, 8))
 
@@ -453,7 +453,7 @@ jobs:
                   lst.orientation = LinearLayout.VERTICAL
                   sv.addView(lst)
                   p.addView(sv, LinearLayout.LayoutParams(dp(c, 280), dp(c, 300)))
-                  r.addView(p)
+                  r.addView(p, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
                   panel = p
                   list = lst
@@ -501,6 +501,9 @@ jobs:
                   if (p.visibility == View.VISIBLE) {
                       p.visibility = View.GONE
                   } else {
+                      val dm = resources.displayMetrics
+                      lp.x = lp.x.coerceIn(0, maxOf(0, dm.widthPixels - dp(this, 300)))
+                      lp.y = lp.y.coerceIn(0, maxOf(0, dm.heightPixels - dp(this, 460)))
                       fill()
                       p.visibility = View.VISIBLE
                   }
